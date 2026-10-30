@@ -14,6 +14,7 @@ load_dart_worktrees_config() {
   local env_sub="${DART_SDK_SUBPATH:-}"
   local env_ws="${DART_VSCODE_WORKSPACE:-}"
   local env_code="${DART_CODE_CMD:-}"
+  local env_seed="${DART_SEED_OUT:-}"
 
   if [[ -f "$cfg_file" ]]; then
     # shellcheck disable=SC1090
@@ -29,12 +30,14 @@ load_dart_worktrees_config() {
   [[ -n "$env_sub" ]] && DART_SDK_SUBPATH="$env_sub"
   [[ -n "$env_ws" ]] && DART_VSCODE_WORKSPACE="$env_ws"
   [[ -n "$env_code" ]] && DART_CODE_CMD="$env_code"
+  [[ -n "$env_seed" ]] && DART_SEED_OUT="$env_seed"
 
   : "${DART_MAIN_CHECKOUT:=$HOME/dart-sdk/sdk}"
   : "${DART_WORKTREES_DIR:=$HOME/dart-sdk-worktrees}"
   : "${DART_LINK:=$HOME/.dart-current}"
   : "${DART_BUILD_MODE:=release}"
   : "${DART_CODE_CMD:=code}"
+  : "${DART_SEED_OUT:=1}"
 
   if [[ -z "${DART_BUILD_ARCH:-}" ]]; then
     case "$(uname -m)" in
@@ -67,9 +70,13 @@ load_dart_worktrees_config() {
   : "${DART_SDK_SUBPATH:=$DART_OUT_DIR_NAME/$DART_CONFIG_NAME/dart-sdk}"
   : "${DART_VSCODE_WORKSPACE:=$(dirname "$DART_MAIN_CHECKOUT")/active.code-workspace}"
 
+  if [[ -z "${RBE_cfg:-}" && -f "$DART_MAIN_CHECKOUT/build/rbe/unix.cfg" ]]; then
+    export RBE_cfg="$DART_MAIN_CHECKOUT/build/rbe/unix.cfg"
+  fi
+
   export DART_MAIN_CHECKOUT DART_WORKTREES_DIR DART_LINK DART_BUILD_MODE \
     DART_BUILD_ARCH DART_OUT_DIR_NAME DART_CONFIG_NAME DART_SDK_SUBPATH \
-    DART_VSCODE_WORKSPACE DART_CODE_CMD
+    DART_VSCODE_WORKSPACE DART_CODE_CMD DART_SEED_OUT
 }
 
 load_dart_worktrees_config

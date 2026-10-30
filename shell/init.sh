@@ -113,11 +113,17 @@ _dw_worktree_names() {
 
 if [ -n "${BASH_VERSION:-}" ]; then
   _nw_complete() {
-    local cur="${COMP_WORDS[COMP_CWORD]}" positional=0 main_ok=true word i
+    local cur="${COMP_WORDS[COMP_CWORD]}" prev="" positional=0 main_ok=true word i
+    (( COMP_CWORD >= 1 )) && prev="${COMP_WORDS[COMP_CWORD-1]}"
+    if [[ "$prev" == "--seed-from" ]]; then
+      # shellcheck disable=SC2207
+      COMPREPLY=($(compgen -W "$(_dw_worktree_names) main" -- "$cur"))
+      return
+    fi
     if [[ "$cur" == -* ]]; then
       # shellcheck disable=SC2207
       COMPREPLY=($(compgen -W \
-        "-b --build -c --code -d --delete -e --existing -f --force -h --help -l --list" \
+        "-b --build -c --code -d --delete -e --existing -f --force -h --help -l --list --seed-out --no-seed-out --seed-from" \
         -- "$cur"))
       return
     fi
@@ -126,6 +132,7 @@ if [ -n "${BASH_VERSION:-}" ]; then
       case "$word" in
         -l|--list|-h|--help) return 0 ;;
         -d|--delete|-e|--existing) main_ok=false ;;
+        --seed-from) i=$((i + 1)) ;;
         -*) ;;
         *) positional=$((positional + 1)) ;;
       esac
@@ -167,17 +174,33 @@ if [ -n "${BASH_VERSION:-}" ]; then
 elif [ -n "${ZSH_VERSION:-}" ]; then
   _nw_zsh_complete() {
     local -a opts names
-    opts=(-b --build -c --code -d --delete -e --existing -f --force -h --help -l --list)
+    local line
+    opts=(
+      -b --build -c --code -d --delete -e --existing -f --force
+      -h --help -l --list --seed-out --no-seed-out --seed-from
+    )
+    if (( CURRENT > 2 )) && [[ "${words[CURRENT-1]}" == "--seed-from" ]]; then
+      names=()
+      while IFS= read -r line; do
+        [ -n "$line" ] && names+=("$line")
+      done <<EOF
+$(_dw_worktree_names)
+EOF
+      names+=(main)
+      compadd -- "${names[@]}"
+      return
+    fi
     if [[ "${words[CURRENT]}" == -* ]]; then
       compadd -- "${opts[@]}"
       return
     fi
-    local i word line positional=0 main_ok=1
+    local i word positional=0 main_ok=1
     for (( i = 2; i < CURRENT; i++ )); do
       word="${words[i]}"
       case "$word" in
         -l|--list|-h|--help) return ;;
         -d|--delete|-e|--existing) main_ok=0 ;;
+        --seed-from) i=$((i + 1)) ;;
         -*) ;;
         *) positional=$((positional + 1)) ;;
       esac

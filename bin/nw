@@ -3,12 +3,14 @@
 #
 # Creating makes $DART_WORKTREES_DIR/<name> from the main checkout, symlinks
 # the gclient-managed dependencies (third_party, buildtools, etc.) from the
-# main checkout, runs the per-checkout gclient hooks, and gives the worktree
-# its own real build output directory.
+# main checkout, runs the per-checkout gclient hooks, and pre-seeds its build
+# output directory (<out>/<config>) from an existing build when available.
 #
 # Usage:
-#   nw [-f|--force] [-b|--build] [-c|--code] <name> [base-ref]
-#   nw [-b|--build] [-c|--code] -e|--existing <name>
+#   nw [-f|--force] [-b|--build] [-c|--code] [--no-seed-out]
+#      [--seed-from <checkout>] <name> [base-ref]
+#   nw [-b|--build] [-c|--code] [--seed-out|--no-seed-out]
+#      [--seed-from <checkout>] -e|--existing <name>
 #   nw -d|--delete [-f|--force] [name]
 #   nw -c|--code
 #   nw -l|--list
@@ -23,11 +25,20 @@
 #   [base-ref]     Starting point for a new branch (default: main checkout
 #                  HEAD).
 #   -e|--existing  Re-apply the setup to an existing worktree. Replaces a
-#                  symlinked build output dir with a real one.
+#                  symlinked build output dir with a real one, and seeds
+#                  <out>/<config> if not yet built (or replaces it with
+#                  --seed-out).
 #   -b|--build     Build the SDK (create_sdk) after setup.
 #   -c|--code      Open/focus active.code-workspace in VS Code (scoping to
 #                  cwd's subfolder if inside a checkout). Once open, VS Code
 #                  follows interactive `nw` switches automatically.
+#   --seed-out     Seed (or re-seed, with -e) <out>/<config> from a built
+#                  checkout. Enabled automatically on new worktrees unless
+#                  DART_SEED_OUT=0 or --no-seed-out is set.
+#   --no-seed-out  Skip seeding <out>/<config>; start with an empty build dir.
+#   --seed-from <checkout>
+#                  Checkout ('main', worktree name, or path) to seed
+#                  <out>/<config> from (implies --seed-out).
 #   -d|--delete    Remove worktree <name> (default: the one containing the
 #                  current directory) and delete branch <name>. Refuses if
 #                  there are uncommitted or untracked changes, unless -f is
@@ -56,6 +67,7 @@ MAIN_CHECKOUT="$DART_MAIN_CHECKOUT"
 MAIN_NAME="main"  # `nw main` switches to $MAIN_CHECKOUT.
 WORKTREES_DIR="$DART_WORKTREES_DIR"
 DART_LINK_PATH="$DART_LINK"
+SEED_SCRIPT="$REPO_ROOT/lib/seed_out.py"
 VSCODE_SYNC="$REPO_ROOT/vscode/src/cliSync.js"
 
 # Git-ignored paths in the main checkout that must NOT be shared: build
@@ -149,12 +161,8 @@ link_dependencies() {
 }
 
 run_per_checkout_hooks() {
-  local dest="$1" hook
-  for hook in "${PER_CHECKOUT_HOOKS[@]}"; do
-    [[ -f "$dest/$hook" ]] || continue
-    log "Running $hook"
-    (cd "$dest" && python3 "$hook")
-  done
+  local dest="$1"
+  python3 "$SEED_SCRIPT" --run-hooks "$dest" "${PER_CHECKOUT_HOOKS[@]}"
 }
 
 # Removes a symlinked build output directory (only the link, never its target).
@@ -174,23 +182,96 @@ create_build_dir() {
   mkdir -p "$out_dir"
 }
 
+SEED_SOURCE=""
+
+resolve_seed_source() {
+  local dest="$1" seed_mode="$2" seed_from="$3"
+  SEED_SOURCE=""
+  local cfg_ninja="$DART_OUT_DIR_NAME/$DART_CONFIG_NAME/build.ninja"
+  local dest_real cand cand_real
+  dest_real="$(cd "$dest" && pwd -P)"
+  if [[ -n "$seed_from" ]]; then
+    if [[ "$seed_from" == "$MAIN_NAME" ]]; then
+      cand="$MAIN_CHECKOUT"
+    elif [[ "$seed_from" != */* && -d "$WORKTREES_DIR/$seed_from" ]]; then
+      cand="$WORKTREES_DIR/$seed_from"
+    else
+      cand="$seed_from"
+    fi
+    [[ -d "$cand" ]] || die "seed checkout not found: $seed_from"
+    cand_real="$(cd "$cand" && pwd -P)"
+    [[ "$cand_real" != "$dest_real" ]] || die "cannot seed $dest from itself"
+    [[ -f "$cand_real/$cfg_ninja" ]] ||
+      die "no built $DART_OUT_DIR_NAME/$DART_CONFIG_NAME in $cand_real"
+    SEED_SOURCE="$cand_real"
+    return 0
+  fi
+  for cand in "$MAIN_CHECKOUT" "$DART_LINK_PATH"; do
+    [[ -n "$cand" && -d "$cand" && -f "$cand/$cfg_ninja" ]] || continue
+    cand_real="$(cd "$cand" && pwd -P)"
+    if [[ "$cand_real" != "$dest_real" ]]; then
+      SEED_SOURCE="$cand_real"
+      return 0
+    fi
+  done
+  if [[ "$seed_mode" == "force" ]]; then
+    die "no built $DART_OUT_DIR_NAME/$DART_CONFIG_NAME found to seed from" \
+      "(pass --seed-from <checkout>)"
+  fi
+  return 0
+}
+
+seed_build_dir() {
+  local dest="$1" seed_mode="$2" seed_from="$3"
+  [[ "$seed_mode" == "never" ]] && return 0
+  local dst_cfg="$dest/$DART_OUT_DIR_NAME/$DART_CONFIG_NAME"
+  if [[ "$seed_mode" == "auto" && -f "$dst_cfg/build.ninja" ]]; then
+    return 0
+  fi
+  resolve_seed_source "$dest" "$seed_mode" "$seed_from"
+  [[ -n "$SEED_SOURCE" ]] || return 0
+  log "Seeding $DART_OUT_DIR_NAME/$DART_CONFIG_NAME from $SEED_SOURCE"
+  local seed_args=(
+    --src "$SEED_SOURCE"
+    --dst "$dest"
+    --out-dir-name "$DART_OUT_DIR_NAME"
+    --config-name "$DART_CONFIG_NAME"
+  )
+  [[ "$seed_mode" == "force" ]] && seed_args+=(--replace)
+  python3 "$SEED_SCRIPT" "${seed_args[@]}"
+}
+
 build_sdk() {
   local dest="$1"
-  log "Building SDK ($DART_CONFIG_NAME — this takes a while)"
+  if [[ -f "$dest/$DART_OUT_DIR_NAME/$DART_CONFIG_NAME/build.ninja" ]]; then
+    log "Building SDK ($DART_CONFIG_NAME — incremental)"
+  else
+    log "Building SDK ($DART_CONFIG_NAME — full build, this takes a while)"
+  fi
   (cd "$dest" && tools/build.py -m "$DART_BUILD_MODE" -a "$DART_BUILD_ARCH" \
     create_sdk)
 }
 
 print_next_steps() {
   local name="$1" dest="$2" built="$3"
+  local dart_bin="$dest/$DART_SDK_SUBPATH/bin/dart"
   log "Done: $dest"
-  $built || echo "    Build with: cd $dest && tools/build.py" \
-    "-m $DART_BUILD_MODE -a $DART_BUILD_ARCH create_sdk"
-  echo "    Then activate with: ds $name"
+  if ! $built; then
+    if [[ -x "$dart_bin" ]]; then
+      echo "    Pre-seeded SDK ready; rebuild changes incrementally with:" \
+        "cd $dest && tools/build.py -m $DART_BUILD_MODE" \
+        "-a $DART_BUILD_ARCH create_sdk"
+    else
+      echo "    Build with: cd $dest && tools/build.py" \
+        "-m $DART_BUILD_MODE -a $DART_BUILD_ARCH create_sdk"
+    fi
+  fi
+  echo "    Activate with: ds $name"
 }
 
 setup_worktree() {
   local name="$1" base="$2" existing="$3" build="$4"
+  local seed_mode="$5" seed_from="$6"
   local dest="$WORKTREES_DIR/$name"
   if $existing; then
     check_existing_worktree "$dest"
@@ -201,6 +282,7 @@ setup_worktree() {
   create_build_dir "$dest"
   link_dependencies "$dest"
   run_per_checkout_hooks "$dest"
+  seed_build_dir "$dest" "$seed_mode" "$seed_from"
   if $build; then build_sdk "$dest"; fi
   print_next_steps "$name" "$dest" "$build"
 }
@@ -306,17 +388,20 @@ confirm_create() {
 # asking, unless force is true).
 switch_or_create_worktree() {
   local name="$1" base="$2" base_given="$3" force="$4" build="$5"
-  local open_code="$6" subpath="$7"
+  local open_code="$6" subpath="$7" seed_mode="$8" seed_from="$9"
+  local seed_opt="${10}"
   local dest="$WORKTREES_DIR/$name"
   if [[ -e "$dest" ]]; then
     check_existing_worktree "$dest"
     $base_given && die "worktree '$name' already exists; base-ref not used"
     $build && die "worktree '$name' already exists; use -e -b to rebuild"
+    [[ -n "$seed_opt" ]] &&
+      die "worktree '$name' already exists; use -e --seed-out to re-seed"
     log "Switching to $dest"
   else
     warn_if_name_too_long "$name"
     $force || confirm_create "$name" "$base" || die "not created"
-    setup_worktree "$name" "$base" false "$build"
+    setup_worktree "$name" "$base" false "$build" "$seed_mode" "$seed_from"
   fi
   request_cd "$dest"
   sync_vscode "$name" "$dest" "$subpath" "$open_code"
@@ -324,9 +409,11 @@ switch_or_create_worktree() {
 
 # Switches to the main checkout (`nw main`).
 switch_to_main_checkout() {
-  local base_given="$1" build="$2" open_code="$3" subpath="$4"
+  local base_given="$1" build="$2" open_code="$3" subpath="$4" seed_opt="$5"
   $base_given && die "'$MAIN_NAME' is the main checkout; base-ref not used"
   $build && die "'$MAIN_NAME' is the main checkout; -b not supported"
+  [[ -n "$seed_opt" ]] &&
+    die "'$MAIN_NAME' is the main checkout; $seed_opt not supported"
   log "Switching to $MAIN_CHECKOUT"
   request_cd "$MAIN_CHECKOUT"
   sync_vscode "$MAIN_NAME" "$MAIN_CHECKOUT" "$subpath" "$open_code"
@@ -454,25 +541,49 @@ list_worktrees() {
 
 main() {
   local build=false existing=false delete=false list=false code=false
-  local force=false args=()
-  for arg in "$@"; do
-    case "$arg" in
-      -b|--build)    build=true ;;
-      -e|--existing) existing=true ;;
-      -d|--delete)   delete=true ;;
-      -l|--list)     list=true ;;
-      -c|--code)     code=true ;;
-      -f|--force)    force=true ;;
-      -h|--help)     usage; return ;;
-      -*)            die "unknown option '$arg'" ;;
-      *)             args+=("$arg") ;;
+  local force=false seed_mode="auto" seed_from="" seed_opt="" args=()
+  if [[ "${DART_SEED_OUT:-1}" == "0" || "${DART_SEED_OUT:-1}" == "false" ]]; then
+    seed_mode="never"
+  fi
+  while (( $# > 0 )); do
+    case "$1" in
+      -b|--build)       build=true; shift ;;
+      -e|--existing)    existing=true; shift ;;
+      -d|--delete)      delete=true; shift ;;
+      -l|--list)        list=true; shift ;;
+      -c|--code)        code=true; shift ;;
+      -f|--force)       force=true; shift ;;
+      --seed-out)       seed_mode="force"; seed_opt="--seed-out"; shift ;;
+      --no-seed-out)
+        seed_mode="never"
+        seed_opt="--no-seed-out"
+        seed_from=""
+        shift
+        ;;
+      --seed-from)
+        [[ $# -ge 2 && -n "$2" ]] || die "--seed-from requires a checkout name or path"
+        seed_mode="force"
+        seed_opt="--seed-from"
+        seed_from="$2"
+        shift 2
+        ;;
+      --seed-from=*)
+        seed_from="${1#*=}"
+        [[ -n "$seed_from" ]] || die "--seed-from requires a checkout name or path"
+        seed_mode="force"
+        seed_opt="--seed-from"
+        shift
+        ;;
+      -h|--help)        usage; return ;;
+      -*)               die "unknown option '$1'" ;;
+      *)                args+=("$1"); shift ;;
     esac
   done
 
   check_main_checkout
 
   if $list; then
-    { $build || $existing || $delete || $code || $force; } &&
+    { $build || $existing || $delete || $code || $force || [[ -n "$seed_opt" ]]; } &&
       die "-l cannot be combined with other options"
     (( ${#args[@]} == 0 )) || { usage; exit 1; }
     list_worktrees
@@ -480,8 +591,8 @@ main() {
   fi
 
   if $delete; then
-    { $build || $existing || $code; } &&
-      die "-d cannot be combined with -b, -e or -c"
+    { $build || $existing || $code || [[ -n "$seed_opt" ]]; } &&
+      die "-d cannot be combined with -b, -e, -c or $seed_opt"
     (( ${#args[@]} <= 1 )) || { usage; exit 1; }
     local name="${args[0]:-}"
     [[ -n "$name" ]] || name="$(worktree_name_from_cwd)"
@@ -491,8 +602,8 @@ main() {
   fi
 
   if $code && (( ${#args[@]} == 0 )); then
-    { $build || $existing || $force; } &&
-      die "-c without a name cannot be combined with -b, -e or -f"
+    { $build || $existing || $force || [[ -n "$seed_opt" ]]; } &&
+      die "-c without a name cannot be combined with -b, -e, -f or $seed_opt"
     open_vscode_for_cwd
     return
   fi
@@ -509,20 +620,22 @@ main() {
   local base_given=false
   (( ${#args[@]} == 2 )) && base_given=true
   if [[ "$name" == "$MAIN_NAME" ]] && ! $existing; then
-    switch_to_main_checkout "$base_given" "$build" "$code" "$cwd_subpath"
+    switch_to_main_checkout "$base_given" "$build" "$code" "$cwd_subpath" \
+      "$seed_opt"
     return
   fi
   check_name "$name"
   if $existing; then
     $force && die "-f cannot be combined with -e"
     warn_if_name_too_long "$name"
-    setup_worktree "$name" HEAD true "$build"
+    setup_worktree "$name" HEAD true "$build" "$seed_mode" "$seed_from"
     request_cd "$WORKTREES_DIR/$name"
     sync_vscode "$name" "$WORKTREES_DIR/$name" "$cwd_subpath" "$code"
     return
   fi
   switch_or_create_worktree "$name" "${args[1]:-HEAD}" "$base_given" \
-    "$force" "$build" "$code" "$cwd_subpath"
+    "$force" "$build" "$code" "$cwd_subpath" "$seed_mode" "$seed_from" \
+    "$seed_opt"
 }
 
 main "$@"

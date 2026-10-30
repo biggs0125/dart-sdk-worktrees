@@ -195,18 +195,19 @@ main() {
 
   # Load any existing config values so re-running ./install.sh preserves them.
   local prev_main="" prev_wt="" prev_link="" prev_mode="" prev_arch=""
-  local prev_out="" prev_sub="" prev_ws="" prev_code=""
+  local prev_out="" prev_sub="" prev_ws="" prev_code="" prev_seed=""
   if [[ -f "$CFG_FILE" ]]; then
     # shellcheck disable=SC1090
     eval "$(
       DART_MAIN_CHECKOUT="" DART_WORKTREES_DIR="" DART_LINK="" \
       DART_BUILD_MODE="" DART_BUILD_ARCH="" DART_OUT_DIR_NAME="" \
       DART_SDK_SUBPATH="" DART_VSCODE_WORKSPACE="" DART_CODE_CMD="" \
+      DART_SEED_OUT="" \
       bash -c 'source "$1" >/dev/null 2>&1 || true
         printf "prev_main=%q\nprev_wt=%q\nprev_link=%q\nprev_mode=%q\n" \
           "$DART_MAIN_CHECKOUT" "$DART_WORKTREES_DIR" "$DART_LINK" "$DART_BUILD_MODE"
-        printf "prev_arch=%q\nprev_out=%q\nprev_sub=%q\nprev_ws=%q\nprev_code=%q\n" \
-          "$DART_BUILD_ARCH" "$DART_OUT_DIR_NAME" "$DART_SDK_SUBPATH" "$DART_VSCODE_WORKSPACE" "$DART_CODE_CMD"
+        printf "prev_arch=%q\nprev_out=%q\nprev_sub=%q\nprev_ws=%q\nprev_code=%q\nprev_seed=%q\n" \
+          "$DART_BUILD_ARCH" "$DART_OUT_DIR_NAME" "$DART_SDK_SUBPATH" "$DART_VSCODE_WORKSPACE" "$DART_CODE_CMD" "$DART_SEED_OUT"
       ' _ "$CFG_FILE"
     )"
   fi
@@ -240,6 +241,7 @@ main() {
   chmod +x \
     "$REPO_ROOT/bin/nw" \
     "$REPO_ROOT/bin/ds" \
+    "$REPO_ROOT/lib/seed_out.py" \
     "$REPO_ROOT/vscode/src/cliSync.js" \
     "$REPO_ROOT/vscode/scripts/package_and_install.py"
   [[ -f "$REPO_ROOT/uninstall.sh" ]] && chmod +x "$REPO_ROOT/uninstall.sh"
@@ -256,6 +258,7 @@ main() {
     [[ -n "$prev_sub" ]]  && printf 'DART_SDK_SUBPATH=%q\n' "$prev_sub"
     [[ -n "$prev_ws" ]]   && printf 'DART_VSCODE_WORKSPACE=%q\n' "$prev_ws"
     [[ -n "$prev_code" ]] && printf 'DART_CODE_CMD=%q\n' "$prev_code"
+    [[ -n "$prev_seed" ]] && printf 'DART_SEED_OUT=%q\n' "$prev_seed"
   } > "$CFG_FILE"
   log "Wrote configuration to $CFG_FILE"
   echo "    DART_MAIN_CHECKOUT=$sdk_dir"
