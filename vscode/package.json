@@ -1,0 +1,65 @@
+{
+  "name": "nw-worktrees",
+  "displayName": "Dart SDK Worktree Follower (nw)",
+  "description": "Keeps your Dart SDK VS Code workspace and open editor tabs following `nw` worktree switches without reloading the window.",
+  "version": "0.1.0",
+  "publisher": "natebiggs",
+  "license": "BSD-3-Clause",
+  "homepage": "https://github.com/biggs0125/dart-sdk-worktrees#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/biggs0125/dart-sdk-worktrees.git",
+    "directory": "vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/biggs0125/dart-sdk-worktrees/issues"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "SCM Providers"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "nwWorktrees.switchWorktree",
+        "title": "Dart Worktrees: Switch Worktree…",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "nwWorktrees.scopeFolders",
+        "title": "Dart Worktrees: Scope Workspace to Package / Subfolder…",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "nwWorktrees.syncNow",
+        "title": "Dart Worktrees: Sync Window with Latest nw Checkout",
+        "icon": "$(sync)"
+      }
+    ],
+    "configuration": {
+      "title": "Dart SDK Worktrees (nw)",
+      "properties": {
+        "nwWorktrees.followNw": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically switch workspace folders and remap open tabs when `nw` changes the active Dart SDK worktree."
+        },
+        "nwWorktrees.followDsSdk": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep workspace `dart.sdkPath` synced to the checkout selected by `ds` (~/.dart-current) whenever a built SDK exists there."
+        }
+      }
+    }
+  }
+}

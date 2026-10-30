@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# nw - "new worktree": switch to, create, list or delete a Dart SDK worktree.
+#
+# Creating makes $DART_WORKTREES_DIR/<name> from the main checkout, symlinks
+# the gclient-managed dependencies (third_party, buildtools, etc.) from the
+# main checkout, runs the per-checkout gclient hooks, and gives the worktree
+# its own real build output directory.
+#
+# Usage:
+#   nw [-f|--force] [-b|--build] [-c|--code] <name> [base-ref]
+#   nw [-b|--build] [-c|--code] -e|--existing <name>
+#   nw -d|--delete [-f|--force] [name]
+#   nw -c|--code
+#   nw -l|--list
+#   nw main
+#
+#   <name>         Worktree directory and branch name. If the worktree exists,
+#                  cd into it. Otherwise offer to create it (-f: no prompt);
+#                  an existing branch with this name is checked out, else a
+#                  new one is created. cd needs the `nw` shell function.
+#   main           cd into the main checkout ($DART_MAIN_CHECKOUT). Reserved,
+#                  so no worktree can be named 'main'.
+#   [base-ref]     Starting point for a new branch (default: main checkout
+#                  HEAD).
+#   -e|--existing  Re-apply the setup to an existing worktree. Replaces a
+#                  symlinked build output dir with a real one.
+#   -b|--build     Build the SDK (create_sdk) after setup.
+#   -c|--code      Open/focus active.code-workspace in VS Code (scoping to
+#                  cwd's subfolder if inside a checkout). Once open, VS Code
+#                  follows interactive `nw` switches automatically.
+#   -d|--delete    Remove worktree <name> (default: the one containing the
+#                  current directory) and delete branch <name>. Refuses if
+#                  there are uncommitted or untracked changes, unless -f is
+#                  given.
+#                  The `nw` shell function then cds out of a deleted dir.
+#   -l|--list      List main and the available worktrees.
+
+set -euo pipefail
+
+resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+MAIN_CHECKOUT="$DART_MAIN_CHECKOUT"
+MAIN_NAME="main"  # `nw main` switches to $MAIN_CHECKOUT.
+WORKTREES_DIR="$DART_WORKTREES_DIR"
+DART_LINK_PATH="$DART_LINK"
+VSCODE_SYNC="$REPO_ROOT/vscode/src/cliSync.js"
+
+# Git-ignored paths in the main checkout that must NOT be shared: build
+# output, per-checkout caches, editor files and hook-generated files.
+EXCLUDE_REGEX='((^|/)out/|^xcodebuild/|^\.vscode/|^pkg/|\.dart_tool/|'
+EXCLUDE_REGEX+='__pycache__|\.pyc$|~$|pubspec\.lock$|pubspec_overrides\.yaml$|'
+EXCLUDE_REGEX+='^sdk/version$|^runtime/tests/vm/dart/generated/)'
+
+# Hooks from DEPS that generate files inside the checkout.
+PER_CHECKOUT_HOOKS=(
+  tools/generate_package_config.py
+  tools/generate_sdk_version_file.py
+  tools/generate_large_tests.py
+)
+
+die() { echo "nw: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+# Prints the header comment (up to the first blank line) without the '#'.
+usage() { sed -En '2,/^$/s/^#( |$)//p' "$0"; }
+
+check_main_checkout() {
+  [[ -d "$MAIN_CHECKOUT" ]] ||
+    die "main checkout not found at $MAIN_CHECKOUT (set DART_MAIN_CHECKOUT or re-run install.sh --sdk <dir>)"
+}
+
+check_name() {
+  local name="$1"
+  [[ "$name" == "$MAIN_NAME" ]] &&
+    die "'$MAIN_NAME' is reserved by nw and ds for $MAIN_CHECKOUT"
+  [[ "$name" == */* || "$name" == .* ]] && die "invalid worktree name '$name'"
+  return 0
+}
+
+# RBE's scandeps_server binds a Unix socket at <out>/<config>/depscan.sock, and
+# gRPC rejects socket paths of 107+ characters, which fails every build.
+MAX_SOCKET_PATH=106
+SOCKET_SUFFIX="$DART_OUT_DIR_NAME/$DART_CONFIG_NAME/depscan.sock"
+
+warn_if_name_too_long() {
+  local name="$1"
+  local socket="$WORKTREES_DIR/$name/$SOCKET_SUFFIX"
+  (( ${#socket} <= MAX_SOCKET_PATH )) && return 0
+  local max_name=$(( ${#name} - ${#socket} + MAX_SOCKET_PATH ))
+  echo "WARNING: worktree name '$name' is too long for RBE builds." >&2
+  echo "  $socket is ${#socket} chars; Unix socket paths must be" \
+    "<= $MAX_SOCKET_PATH, so builds will fail. Use a name of at most" \
+    "$max_name chars (fewer for longer configs than $DART_CONFIG_NAME)." >&2
+}
+
+# ---------------------------------------------------------------------------
+# Creating / setting up worktrees
+# ---------------------------------------------------------------------------
+
+create_worktree() {
+  local name="$1" dest="$2" base="$3"
+  [[ -e "$dest" ]] && die "$dest already exists (use --existing to set it up)"
+  mkdir -p "$WORKTREES_DIR"
+  log "Creating worktree $dest"
+  if git -C "$MAIN_CHECKOUT" show-ref --verify --quiet "refs/heads/$name"; then
+    git -C "$MAIN_CHECKOUT" worktree add --quiet "$dest" "$name"
+  else
+    git -C "$MAIN_CHECKOUT" worktree add --quiet -b "$name" "$dest" "$base"
+  fi
+}
+
+check_existing_worktree() {
+  local dest="$1"
+  [[ -d "$dest" ]] || die "no worktree at $dest"
+  [[ -f "$dest/.git" ]] || die "$dest is not a git worktree"
+}
+
+# Prints git-ignored paths in the main checkout that should be shared.
+shared_dependency_paths() {
+  git -C "$MAIN_CHECKOUT" ls-files --others --ignored --exclude-standard \
+      --directory | grep -Ev "$EXCLUDE_REGEX"
+}
+
+link_dependencies() {
+  local dest="$1" path count=0
+  log "Linking gclient dependencies from $MAIN_CHECKOUT"
+  while IFS= read -r path; do
+    path="${path%/}"
+    # Never shadow anything the worktree already has (e.g. tracked files).
+    [[ -e "$dest/$path" || -L "$dest/$path" ]] && continue
+    mkdir -p "$(dirname "$dest/$path")"
+    ln -s "$MAIN_CHECKOUT/$path" "$dest/$path"
+    count=$((count + 1))
+  done < <(shared_dependency_paths)
+  echo "    linked $count paths"
+}
+
+run_per_checkout_hooks() {
+  local dest="$1" hook
+  for hook in "${PER_CHECKOUT_HOOKS[@]}"; do
+    [[ -f "$dest/$hook" ]] || continue
+    log "Running $hook"
+    (cd "$dest" && python3 "$hook")
+  done
+}
+
+# Removes a symlinked build output directory (only the link, never its target).
+unlink_shared_build_dirs() {
+  local dest="$1" d
+  for d in out xcodebuild; do
+    if [[ -L "$dest/$d" ]]; then
+      log "Replacing $d symlink ($(readlink "$dest/$d")) with a real dir"
+      rm "$dest/$d"
+    fi
+  done
+}
+
+create_build_dir() {
+  local dest="$1" out_dir="$dest/$DART_OUT_DIR_NAME"
+  [[ -L "$out_dir" ]] && die "$out_dir is a symlink; refusing to continue"
+  mkdir -p "$out_dir"
+}
+
+build_sdk() {
+  local dest="$1"
+  log "Building SDK ($DART_CONFIG_NAME — this takes a while)"
+  (cd "$dest" && tools/build.py -m "$DART_BUILD_MODE" -a "$DART_BUILD_ARCH" \
+    create_sdk)
+}
+
+print_next_steps() {
+  local name="$1" dest="$2" built="$3"
+  log "Done: $dest"
+  $built || echo "    Build with: cd $dest && tools/build.py" \
+    "-m $DART_BUILD_MODE -a $DART_BUILD_ARCH create_sdk"
+  echo "    Then activate with: ds $name"
+}
+
+setup_worktree() {
+  local name="$1" base="$2" existing="$3" build="$4"
+  local dest="$WORKTREES_DIR/$name"
+  if $existing; then
+    check_existing_worktree "$dest"
+    unlink_shared_build_dirs "$dest"
+  else
+    create_worktree "$name" "$dest" "$base"
+  fi
+  create_build_dir "$dest"
+  link_dependencies "$dest"
+  run_per_checkout_hooks "$dest"
+  if $build; then build_sdk "$dest"; fi
+  print_next_steps "$name" "$dest" "$build"
+}
+
+# ---------------------------------------------------------------------------
+# Switching to worktrees & syncing VS Code
+# ---------------------------------------------------------------------------
+
+CWD_CHECKOUT_NAME=""
+CWD_CHECKOUT_ROOT=""
+CWD_CHECKOUT_SUB=""
+
+# Populates CWD_CHECKOUT_{NAME,ROOT,SUB} if cwd is inside main or a worktree.
+detect_cwd_checkout() {
+  CWD_CHECKOUT_NAME=""
+  CWD_CHECKOUT_ROOT=""
+  CWD_CHECKOUT_SUB=""
+  local cwd main_root wt_root rest name
+  cwd="$(pwd -P 2>/dev/null || true)"
+  [[ -n "$cwd" ]] || return 1
+  if [[ -d "$MAIN_CHECKOUT" ]]; then
+    main_root="$(cd "$MAIN_CHECKOUT" && pwd -P)"
+    if [[ "$cwd" == "$main_root" ]]; then
+      CWD_CHECKOUT_NAME="$MAIN_NAME"
+      CWD_CHECKOUT_ROOT="$MAIN_CHECKOUT"
+      return 0
+    elif [[ "$cwd" == "$main_root/"* ]]; then
+      CWD_CHECKOUT_NAME="$MAIN_NAME"
+      CWD_CHECKOUT_ROOT="$MAIN_CHECKOUT"
+      CWD_CHECKOUT_SUB="${cwd#"$main_root"/}"
+      return 0
+    fi
+  fi
+  if [[ -d "$WORKTREES_DIR" ]]; then
+    wt_root="$(cd "$WORKTREES_DIR" && pwd -P)"
+    if [[ "$cwd/" == "$wt_root"/*/* ]]; then
+      rest="${cwd#"$wt_root"/}"
+      name="${rest%%/*}"
+      if [[ -f "$WORKTREES_DIR/$name/.git" ]]; then
+        CWD_CHECKOUT_NAME="$name"
+        CWD_CHECKOUT_ROOT="$WORKTREES_DIR/$name"
+        [[ "$rest" == */* ]] && CWD_CHECKOUT_SUB="${rest#*/}"
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+# Notifies VS Code of an active checkout change (interactive shells via
+# NW_CD_FILE, or explicit -c/--code; skipped for non-interactive agent runs).
+sync_vscode() {
+  local name="$1" dest="$2" subpath="${3:-}" open_code="${4:-false}"
+  [[ -f "$VSCODE_SYNC" ]] && command -v node >/dev/null 2>&1 || return 0
+  if ! $open_code && [[ -z "${NW_CD_FILE:-}" ]]; then
+    return 0
+  fi
+  local sync_args=(--name "$name" --checkout "$dest")
+  [[ -n "$subpath" ]] && sync_args+=(--subpath "$subpath")
+  $open_code && sync_args+=(--open)
+  node "$VSCODE_SYNC" "${sync_args[@]}" || true
+}
+
+# Opens/focuses active.code-workspace for the current checkout.
+open_vscode_for_cwd() {
+  command -v node >/dev/null 2>&1 || die "'node' is required for nw -c"
+  [[ -f "$VSCODE_SYNC" ]] || die "missing $VSCODE_SYNC"
+  if detect_cwd_checkout; then
+    local sync_args=(--name "$CWD_CHECKOUT_NAME"
+                     --checkout "$CWD_CHECKOUT_ROOT" --open)
+    [[ -n "$CWD_CHECKOUT_SUB" ]] &&
+      sync_args+=(--subpath "$CWD_CHECKOUT_SUB")
+    node "$VSCODE_SYNC" "${sync_args[@]}"
+  else
+    node "$VSCODE_SYNC" --open
+  fi
+}
+
+# A script can't change its caller's directory, so the `nw` shell function
+# passes a file in NW_CD_FILE and cds to the path written there on success.
+request_cd() {
+  local dest="$1"
+  if [[ -n "${NW_CD_FILE:-}" ]]; then
+    echo "$dest" > "$NW_CD_FILE"
+  else
+    echo "    cd $dest  (define the nw shell function to cd automatically)"
+  fi
+}
+
+# Returns success if the user agrees to create worktree <name>.
+confirm_create() {
+  local name="$1" base="$2"
+  [[ -t 0 ]] || die "no worktree named '$name' (use -f to create it)"
+  local from="new branch from $base"
+  git -C "$MAIN_CHECKOUT" show-ref --verify --quiet "refs/heads/$name" &&
+    from="existing branch '$name'"
+  local reply
+  read -r -p "No worktree named '$name'. Create it ($from)? [y/N] " reply
+  [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
+}
+
+# Switches to worktree <name>, creating it first if it doesn't exist (after
+# asking, unless force is true).
+switch_or_create_worktree() {
+  local name="$1" base="$2" base_given="$3" force="$4" build="$5"
+  local open_code="$6" subpath="$7"
+  local dest="$WORKTREES_DIR/$name"
+  if [[ -e "$dest" ]]; then
+    check_existing_worktree "$dest"
+    $base_given && die "worktree '$name' already exists; base-ref not used"
+    $build && die "worktree '$name' already exists; use -e -b to rebuild"
+    log "Switching to $dest"
+  else
+    warn_if_name_too_long "$name"
+    $force || confirm_create "$name" "$base" || die "not created"
+    setup_worktree "$name" "$base" false "$build"
+  fi
+  request_cd "$dest"
+  sync_vscode "$name" "$dest" "$subpath" "$open_code"
+}
+
+# Switches to the main checkout (`nw main`).
+switch_to_main_checkout() {
+  local base_given="$1" build="$2" open_code="$3" subpath="$4"
+  $base_given && die "'$MAIN_NAME' is the main checkout; base-ref not used"
+  $build && die "'$MAIN_NAME' is the main checkout; -b not supported"
+  log "Switching to $MAIN_CHECKOUT"
+  request_cd "$MAIN_CHECKOUT"
+  sync_vscode "$MAIN_NAME" "$MAIN_CHECKOUT" "$subpath" "$open_code"
+}
+
+# ---------------------------------------------------------------------------
+# Deleting worktrees
+# ---------------------------------------------------------------------------
+
+# Prints the name of the worktree containing the current directory.
+worktree_name_from_cwd() {
+  local cwd root rel
+  [[ -d "$WORKTREES_DIR" ]] ||
+    die "not inside a worktree in $WORKTREES_DIR (pass a name)"
+  cwd="$(pwd -P)"
+  root="$(cd "$WORKTREES_DIR" && pwd -P)"
+  case "$cwd/" in
+    "$root"/*/*) ;;
+    *) die "not inside a worktree in $WORKTREES_DIR (pass a name)" ;;
+  esac
+  rel="${cwd#"$root"/}"
+  echo "${rel%%/*}"
+}
+
+# Points the global `ds` link back at the main checkout if it would dangle.
+reset_global_dart_if_active() {
+  local dest="$1"
+  [[ "$(readlink "$DART_LINK_PATH" 2>/dev/null)" == "$dest" ]] || return 0
+  log "Global Dart was using this worktree; switching back to main"
+  ln -sfn "$MAIN_CHECKOUT" "$DART_LINK_PATH"
+}
+
+remove_worktree() {
+  local dest="$1" force="$2"
+  # Git removes symlinks without following them, so the shared deps in the
+  # main checkout are untouched. Tracked changes and untracked files make
+  # git refuse unless --force is given.
+  log "Removing worktree $dest"
+  if $force; then
+    git -C "$MAIN_CHECKOUT" worktree remove --force "$dest"
+  else
+    git -C "$MAIN_CHECKOUT" worktree remove "$dest" ||
+      die "not removed; commit/stash your changes or re-run with -f"
+  fi
+}
+
+# Deletes branch <name>, printing how to restore it. A failure (e.g. the
+# branch is checked out elsewhere) is reported but not fatal.
+delete_branch() {
+  local name="$1" sha
+  sha="$(git -C "$MAIN_CHECKOUT" rev-parse --quiet --verify \
+    "refs/heads/$name")" || return 0
+  log "Deleting branch $name"
+  if git -C "$MAIN_CHECKOUT" branch --quiet -D "$name"; then
+    echo "    Restore with: git branch $name $sha"
+  else
+    echo "    Branch '$name' was kept" >&2
+  fi
+}
+
+delete_worktree() {
+  local name="$1" force="$2"
+  local dest="$WORKTREES_DIR/$name"
+  check_existing_worktree "$dest"
+  local caller_name="" caller_root=""
+  if detect_cwd_checkout; then
+    caller_name="$CWD_CHECKOUT_NAME"
+    caller_root="$CWD_CHECKOUT_ROOT"
+  fi
+  local branch
+  branch="$(git -C "$dest" branch --show-current)"
+  # Don't keep this process inside the directory being removed.
+  cd "$MAIN_CHECKOUT"
+  remove_worktree "$dest" "$force"
+  reset_global_dart_if_active "$dest"
+  if [[ -f "$VSCODE_SYNC" ]] && command -v node >/dev/null 2>&1; then
+    local fb_name="$MAIN_NAME" fb_root="$MAIN_CHECKOUT"
+    if [[ -n "$caller_root" && "$caller_root" != "$dest" &&
+          -d "$caller_root" ]]; then
+      fb_name="$caller_name"
+      fb_root="$caller_root"
+    fi
+    if [[ "$caller_root" == "$dest" && -n "${NW_CD_FILE:-}" ]]; then
+      node "$VSCODE_SYNC" --name "$fb_name" --checkout "$fb_root" || true
+    else
+      node "$VSCODE_SYNC" --if-active "$dest" --name "$fb_name" \
+        --checkout "$fb_root" || true
+    fi
+  fi
+  log "Deleted $dest"
+  delete_branch "$name"
+  [[ -n "$branch" && "$branch" != "$name" ]] &&
+    echo "    Branch '$branch' was kept" \
+    "(delete with: git branch -D $branch)"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Listing worktrees
+# ---------------------------------------------------------------------------
+
+# Prints one `nw -l` line, marking the checkout containing cwd with `*`.
+print_list_entry() {
+  local label="$1" dir="$2" cwd="$3" marker=" " root
+  if [[ -n "$cwd" && -d "$dir" ]]; then
+    root="$(cd "$dir" && pwd -P)"
+    [[ "$cwd/" == "$root/"* ]] && marker="*"
+  fi
+  echo "$marker $label"
+}
+
+list_worktrees() {
+  local cwd dir
+  cwd="$(pwd -P 2>/dev/null || true)"
+  print_list_entry "$MAIN_NAME" "$MAIN_CHECKOUT" "$cwd"
+  for dir in "$WORKTREES_DIR"/*/; do
+    [[ -f "$dir.git" ]] || continue
+    dir="${dir%/}"
+    print_list_entry "${dir##*/}" "$dir" "$cwd"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+  local build=false existing=false delete=false list=false code=false
+  local force=false args=()
+  for arg in "$@"; do
+    case "$arg" in
+      -b|--build)    build=true ;;
+      -e|--existing) existing=true ;;
+      -d|--delete)   delete=true ;;
+      -l|--list)     list=true ;;
+      -c|--code)     code=true ;;
+      -f|--force)    force=true ;;
+      -h|--help)     usage; return ;;
+      -*)            die "unknown option '$arg'" ;;
+      *)             args+=("$arg") ;;
+    esac
+  done
+
+  check_main_checkout
+
+  if $list; then
+    { $build || $existing || $delete || $code || $force; } &&
+      die "-l cannot be combined with other options"
+    (( ${#args[@]} == 0 )) || { usage; exit 1; }
+    list_worktrees
+    return
+  fi
+
+  if $delete; then
+    { $build || $existing || $code; } &&
+      die "-d cannot be combined with -b, -e or -c"
+    (( ${#args[@]} <= 1 )) || { usage; exit 1; }
+    local name="${args[0]:-}"
+    [[ -n "$name" ]] || name="$(worktree_name_from_cwd)"
+    check_name "$name"
+    delete_worktree "$name" "$force"
+    return
+  fi
+
+  if $code && (( ${#args[@]} == 0 )); then
+    { $build || $existing || $force; } &&
+      die "-c without a name cannot be combined with -b, -e or -f"
+    open_vscode_for_cwd
+    return
+  fi
+
+  local cwd_subpath=""
+  if $code && detect_cwd_checkout; then
+    cwd_subpath="$CWD_CHECKOUT_SUB"
+  fi
+
+  local max_args=2
+  $existing && max_args=1
+  (( ${#args[@]} >= 1 && ${#args[@]} <= max_args )) || { usage; exit 1; }
+  local name="${args[0]}"
+  local base_given=false
+  (( ${#args[@]} == 2 )) && base_given=true
+  if [[ "$name" == "$MAIN_NAME" ]] && ! $existing; then
+    switch_to_main_checkout "$base_given" "$build" "$code" "$cwd_subpath"
+    return
+  fi
+  check_name "$name"
+  if $existing; then
+    $force && die "-f cannot be combined with -e"
+    warn_if_name_too_long "$name"
+    setup_worktree "$name" HEAD true "$build"
+    request_cd "$WORKTREES_DIR/$name"
+    sync_vscode "$name" "$WORKTREES_DIR/$name" "$cwd_subpath" "$code"
+    return
+  fi
+  switch_or_create_worktree "$name" "${args[1]:-HEAD}" "$base_given" \
+    "$force" "$build" "$code" "$cwd_subpath"
+}
+
+main "$@"

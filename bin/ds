@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# ds - "dart switch": point the active Dart SDK at a git worktree.
+#
+# Global mode repoints the symlink $DART_LINK (~/.dart-current) at a checkout
+# root, which affects every shell. Local mode (-l) only changes the current
+# shell via the `ds` function sourced from shell/init.sh.
+#
+# Usage:
+#   ds [-l] [name]  Use $DART_WORKTREES_DIR/<name>, or the worktree containing
+#                   the current directory if no name is given.
+#                   The name 'main' means $DART_MAIN_CHECKOUT.
+#   ds clear        Globally go back to main (same as 'ds main').
+#   ds -l clear     Drop this shell's local override (follow global again).
+#   ds status       Show the active checkout(s).
+#   ds list         List main and the available worktrees.
+
+set -euo pipefail
+
+resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+WORKTREES_DIR="$DART_WORKTREES_DIR"
+MAIN_CHECKOUT="$DART_MAIN_CHECKOUT"
+LINK="$DART_LINK"
+SDK_SUBPATH="$DART_SDK_SUBPATH"
+# Set by local mode in the calling shell; empty when following the link.
+LOCAL_CHECKOUT="${DS_LOCAL_CHECKOUT:-}"
+
+die() { echo "ds: $*" >&2; exit 1; }
+
+# Prints the header comment (up to the first blank line) without the '#'.
+usage() { sed -En '2,/^$/s/^#( |$)//p' "$0"; }
+
+# Prints the worktree root containing the current directory, if any.
+worktree_from_cwd() {
+  local cwd root
+  [[ -d "$WORKTREES_DIR" ]] ||
+    die "not inside a worktree in $WORKTREES_DIR (try 'ds <name>')"
+  cwd="$(pwd -P)"
+  root="$(cd "$WORKTREES_DIR" && pwd -P)"
+  case "$cwd/" in
+    "$root"/*/*) ;;
+    *) die "not inside a worktree in $WORKTREES_DIR (try 'ds <name>')" ;;
+  esac
+  local rel="${cwd#"$root"/}"
+  echo "$root/${rel%%/*}"
+}
+
+worktree_by_name() {
+  local dir="$WORKTREES_DIR/$1"
+  [[ -d "$dir" ]] || die "no worktree named '$1' (see 'ds list')"
+  echo "$dir"
+}
+
+# Resolves an optional name to a checkout root: 'main' is the main
+# checkout, other names are worktrees, and no name means the cwd's worktree.
+resolve_worktree() {
+  case "${1:-}" in
+    "")      worktree_from_cwd ;;
+    main)    echo "$MAIN_CHECKOUT" ;;
+    *)       worktree_by_name "$1" ;;
+  esac
+}
+
+warn_if_unbuilt() {
+  local checkout="$1"
+  if [[ ! -x "$checkout/$SDK_SUBPATH/bin/dart" ]]; then
+    echo "warning: $checkout/$SDK_SUBPATH/bin/dart not built yet" >&2
+  fi
+}
+
+switch_global() {
+  local checkout="$1"
+  ln -sfn "$checkout" "$LINK"
+  echo "Active Dart checkout: $checkout"
+  warn_if_unbuilt "$checkout"
+  if [[ -n "$LOCAL_CHECKOUT" ]]; then
+    echo "note: this shell has a local override ($LOCAL_CHECKOUT);" \
+      "'ds -l clear' to follow the global one" >&2
+  fi
+}
+
+# Prints $PATH with the current Dart bin entry replaced by the one for the
+# given SDK root (a checkout or the link). Prepends it if none is found.
+path_with_dart_root() {
+  local new_bin="$1/$SDK_SUBPATH/bin"
+  local old_bins=("$LINK/$SDK_SUBPATH/bin")
+  [[ -n "$LOCAL_CHECKOUT" ]] && old_bins+=("$LOCAL_CHECKOUT/$SDK_SUBPATH/bin")
+
+  local entry old result=() replaced=false
+  IFS=: read -r -a entries <<< "$PATH"
+  for entry in "${entries[@]}"; do
+    for old in "${old_bins[@]}"; do
+      if [[ "$entry" == "$old" ]]; then
+        $replaced || result+=("$new_bin")
+        replaced=true
+        continue 2
+      fi
+    done
+    result+=("$entry")
+  done
+  $replaced || result=("$new_bin" "${result[@]}")
+  (IFS=:; echo "${result[*]}")
+}
+
+# Prints shell code that points this shell's Dart env at the given root.
+print_env_for_root() {
+  local root="$1"
+  printf 'export DART_SDK=%q\n' "$root"
+  printf 'export PATH=%q\n' "$(path_with_dart_root "$root")"
+  if [[ -f "$MAIN_CHECKOUT/build/rbe/unix.cfg" ]]; then
+    printf 'export RBE_cfg=%q\n' "$root/build/rbe/unix.cfg"
+  fi
+}
+
+# Output is eval'ed by the `ds` shell function; messages go to stderr.
+print_local_env() {
+  if [[ "${1:-}" == "clear" ]]; then
+    print_env_for_root "$LINK"
+    echo 'unset DS_LOCAL_CHECKOUT'
+    echo "Shell following global Dart checkout: $(readlink "$LINK")" >&2
+    return
+  fi
+  local checkout
+  checkout="$(resolve_worktree "${1:-}")"
+  print_env_for_root "$checkout"
+  printf 'export DS_LOCAL_CHECKOUT=%q\n' "$checkout"
+  echo "Shell-local Dart checkout: $checkout" >&2
+  warn_if_unbuilt "$checkout"
+}
+
+show_status() {
+  [[ -L "$LINK" ]] || die "$LINK is not set up (run 'ds main' or install.sh)"
+  if [[ -n "$LOCAL_CHECKOUT" ]]; then
+    echo "local:  $LOCAL_CHECKOUT"
+    echo "global: $(readlink "$LINK")"
+  else
+    readlink "$LINK"
+  fi
+}
+
+# Prints one `ds list` line, marking the global (*) or local (L) checkout.
+print_list_entry() {
+  local label="$1" dir="$2" global="$3" marker=" "
+  [[ "$dir" == "$global" ]] && marker="*"
+  [[ "$dir" == "$LOCAL_CHECKOUT" ]] && marker="L"
+  echo "$marker $label"
+}
+
+list_worktrees() {
+  local global="" dir
+  [[ -L "$LINK" ]] && global="$(readlink "$LINK")"
+  print_list_entry "main" "$MAIN_CHECKOUT" "$global"
+  for dir in "$WORKTREES_DIR"/*/; do
+    [[ -f "$dir.git" ]] || continue
+    dir="${dir%/}"
+    print_list_entry "${dir##*/}" "$dir" "$global"
+  done
+  [[ -n "$LOCAL_CHECKOUT" ]] && echo "(* = global, L = this shell)"
+  return 0
+}
+
+main() {
+  case "${1:-}" in
+    --print-local-env) print_local_env "${2:-}" ;;
+    -l|--local)
+      die "local mode needs the 'ds' shell function (source shell/init.sh)" ;;
+    clear)       switch_global "$MAIN_CHECKOUT" ;;
+    status)      show_status ;;
+    list|--list) list_worktrees ;;
+    -h|--help)   usage ;;
+    *)
+      local checkout
+      checkout="$(resolve_worktree "${1:-}")"
+      switch_global "$checkout"
+      ;;
+  esac
+}
+
+main "$@"
