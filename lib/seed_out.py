@@ -384,7 +384,7 @@ def _seed_with_siso(
     rel_config: str,
     diff_paths: set[str],
     cloner: _FileCloner,
-) -> tuple[int, int]:
+) -> tuple[int, int, set[str]]:
     src_prefix = src_root + "/"
     dst_prefix = dst_root + "/"
     src_prefix_b = os.fsencode(src_prefix)
@@ -603,7 +603,7 @@ def _seed_with_siso(
             )
 
     total_bytes = sum(j[4] for j in copy_jobs)
-    return len(copy_jobs), total_bytes
+    return len(copy_jobs), total_bytes, effective_diff
 
 
 def _seed_with_ninja(
@@ -612,7 +612,7 @@ def _seed_with_ninja(
     rel_config: str,
     diff_paths: set[str],
     cloner: _FileCloner,
-) -> tuple[int, int]:
+) -> tuple[int, int, set[str]]:
     src_prefix = src_root + "/"
     dst_prefix = dst_root + "/"
     src_prefix_b = os.fsencode(src_prefix)
@@ -711,7 +711,7 @@ def _seed_with_ninja(
             )
 
     total_bytes = sum(j[4] for j in copy_jobs)
-    return len(copy_jobs), total_bytes
+    return len(copy_jobs), total_bytes, diff_paths
 
 
 def _run_hooks_preserving_unchanged_mtimes(
@@ -876,12 +876,12 @@ def main() -> int:
     siso_bin = _find_siso_binary(src_root, dst_root) if os.path.isfile(siso_state) else None
 
     if siso_bin is not None:
-        num_files, total_bytes = _seed_with_siso(
+        num_files, total_bytes, active_diff = _seed_with_siso(
             siso_bin, src_root, dst_root, rel_config, diff_paths, cloner
         )
         mode_label = "Siso"
     else:
-        num_files, total_bytes = _seed_with_ninja(
+        num_files, total_bytes, active_diff = _seed_with_ninja(
             src_root, dst_root, rel_config, diff_paths, cloner
         )
         mode_label = "Ninja"
@@ -892,6 +892,16 @@ def main() -> int:
         f"    seeded {num_files:,} files ({_format_bytes(total_bytes)}, "
         f"{mode_label} {method}) in {elapsed:.1f}s"
     )
+    if active_diff:
+        shown = sorted(active_diff)[:3]
+        more = (
+            f", +{len(active_diff) - 3} more" if len(active_diff) > 3 else ""
+        )
+        noun = "file differs" if len(active_diff) == 1 else "files differ"
+        print(
+            f"    note: {len(active_diff)} {noun} from seed build "
+            f"({', '.join(shown)}{more}); dependent targets will rebuild"
+        )
     return 0
 
 
