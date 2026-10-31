@@ -22,6 +22,14 @@ const STATE_DIR = path.join(
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const WINDOW_LOCK_FILE = path.join(STATE_DIR, 'active-window.json');
 
+/**
+ * Stable folder kept first in `active.code-workspace`. VS Code restarts the
+ * extension host whenever the first workspace folder changes, so keeping it
+ * fixed lets worktree switches update the SDK folders without a restart.
+ */
+const WORKSPACE_ANCHOR_DIR = path.join(STATE_DIR, 'workspace-anchor');
+const WORKSPACE_ANCHOR_NAME = 'nw';
+
 /** Exclusions from sdk.code-workspace when the checkout root itself is opened. */
 const ROOT_ANALYSIS_EXCLUDES = [
   '.dart_tool',
@@ -402,6 +410,31 @@ function buildWorkspaceConfig(checkoutRoot, checkoutName, subpaths, opts = {}) {
 }
 
 /**
+ * Creates the workspace anchor folder and points its terminal cwd at
+ * `terminalCwd`, so new terminals open there instead of in the empty anchor.
+ *
+ * @param {string} terminalCwd
+ * @param {string} [anchorDir]
+ * @returns {string} The anchor folder path.
+ */
+function ensureWorkspaceAnchor(terminalCwd, anchorDir = WORKSPACE_ANCHOR_DIR) {
+  const settingsPath = path.join(anchorDir, '.vscode', 'settings.json');
+  const settings = {
+    'terminal.integrated.cwd': terminalCwd,
+    'files.exclude': { '.vscode': true },
+  };
+  const text = JSON.stringify(settings, null, 2) + '\n';
+  try {
+    if (fs.readFileSync(settingsPath, 'utf8') === text) return anchorDir;
+  } catch (_) {
+    // Missing settings file; create it below.
+  }
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, text, 'utf8');
+  return anchorDir;
+}
+
+/**
  * Reads `~/.local/state/nw/state.json`, or `null` if missing/corrupt.
  *
  * @param {string} [stateFile]
@@ -462,11 +495,12 @@ function isManagedWorkspaceWindowAlive(lockFile = WINDOW_LOCK_FILE) {
  * @param {string} checkoutRoot
  * @param {string} checkoutName
  * @param {string[] | null} [explicitSubpaths]
- * @param {{workspacePath?: string, mainCheckout?: string, worktreesDir?: string, dartLink?: string, sdkSubpath?: string}} [opts]
+ * @param {{workspacePath?: string, anchorDir?: string, mainCheckout?: string, worktreesDir?: string, dartLink?: string, sdkSubpath?: string}} [opts]
  */
 function syncWorkspaceFileOnDisk(checkoutRoot, checkoutName, explicitSubpaths = null, opts = {}) {
   const cfg = loadConfig();
   const wsPath = opts.workspacePath || cfg.activeWorkspacePath;
+  const anchorDir = path.resolve(opts.anchorDir || WORKSPACE_ANCHOR_DIR);
   /** @type {Record<string, any>} */
   let existingSettings = {};
   /** @type {string[]} */
@@ -485,6 +519,7 @@ function syncWorkspaceFileOnDisk(checkoutRoot, checkoutName, explicitSubpaths = 
         for (const f of raw.folders) {
           if (!f || typeof f.path !== 'string') continue;
           const abs = path.resolve(wsDir, f.path);
+          if (abs === anchorDir) continue;
           const parsed = parseSdkPath(abs, opts);
           if (parsed) {
             existingSubpaths.push(parsed.relPath);
@@ -512,6 +547,8 @@ function syncWorkspaceFileOnDisk(checkoutRoot, checkoutName, explicitSubpaths = 
     sdkSubpath: opts.sdkSubpath,
   });
   config.folders.push(...nonSdkFolders);
+  ensureWorkspaceAnchor(config.folders[0].path, anchorDir);
+  config.folders.unshift({ name: WORKSPACE_ANCHOR_NAME, path: anchorDir });
 
   fs.mkdirSync(path.dirname(wsPath), { recursive: true });
   const tmp = `${wsPath}.${process.pid}.tmp`;
@@ -527,6 +564,8 @@ module.exports = {
   STATE_DIR,
   STATE_FILE,
   WINDOW_LOCK_FILE,
+  WORKSPACE_ANCHOR_DIR,
+  WORKSPACE_ANCHOR_NAME,
   ROOT_ANALYSIS_EXCLUDES,
   SUBPATH_ANALYSIS_EXCLUDES,
   parseConfigEnv,
@@ -539,6 +578,7 @@ module.exports = {
   resolveBuiltDartSdkPath,
   computeWorkspaceSettings,
   buildWorkspaceConfig,
+  ensureWorkspaceAnchor,
   readState,
   writeState,
   isManagedWorkspaceWindowAlive,

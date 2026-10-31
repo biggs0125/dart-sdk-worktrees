@@ -9,6 +9,7 @@ const {
   MAIN_NAME,
   STATE_DIR,
   WINDOW_LOCK_FILE,
+  WORKSPACE_ANCHOR_NAME,
   loadConfig,
   parseSdkPath,
   listCheckouts,
@@ -17,6 +18,7 @@ const {
   formatFolderName,
   resolveBuiltDartSdkPath,
   computeWorkspaceSettings,
+  ensureWorkspaceAnchor,
   readState,
   writeState,
   isManagedWorkspaceWindowAlive,
@@ -250,10 +252,11 @@ class WorktreeController {
       }
     }
 
-    // When VS Code updates folder[0] in `active.code-workspace`, it restarts
-    // the background Extension Host (without reloading the window) AFTER
-    // updating `folders`. Finish syncing workspace settings and remapping any
-    // open tabs from the previous worktree right here on startup!
+    // VS Code restarts the background Extension Host (without reloading the
+    // window) AFTER updating `folders` if folder[0] in `active.code-workspace`
+    // changed, e.g. when migrating to the stable workspace anchor folder.
+    // Finish syncing workspace settings and remapping any open tabs from the
+    // previous worktree right here on startup!
     if (mode === 'managed' && sdkFolders.length > 0) {
       const activeCheckout = sdkFolders[0].checkoutRoot;
       const activeName = sdkFolders[0].checkoutName;
@@ -708,6 +711,7 @@ class WorktreeController {
           });
         }
       }
+      this.prependWorkspaceAnchor(nextFolders);
 
       const foldersChanged =
         currentFolders.length !== nextFolders.length ||
@@ -718,7 +722,7 @@ class WorktreeController {
         );
 
       if (foldersChanged) {
-        await this.applyWorkspaceFoldersUpdate(currentFolders.length, nextFolders);
+        await this.applyWorkspaceFoldersUpdate(currentFolders, nextFolders);
       }
 
       await this.updateManagedWorkspaceSettings(targetName, effectiveSubpaths);
@@ -746,10 +750,41 @@ class WorktreeController {
   }
 
   /**
-   * @param {number} deleteCount
+   * Moves the stable workspace anchor folder to the front of `folders`, so
+   * folder[0] stays the same across worktree switches and VS Code doesn't
+   * restart the extension host (which prompts if custom editors are open).
+   *
+   * @param {Array<{uri: vscode.Uri, name?: string}>} folders
+   */
+  prependWorkspaceAnchor(folders) {
+    const firstSdkFolder = folders.find(
+      (f) => f.uri.scheme === 'file' && parseSdkPath(f.uri.fsPath, this.cfg)
+    );
+    const anchorUri = vscode.Uri.file(
+      ensureWorkspaceAnchor(firstSdkFolder ? firstSdkFolder.uri.fsPath : this.cfg.mainCheckout)
+    );
+    const existing = folders.findIndex((f) => f.uri.toString() === anchorUri.toString());
+    if (existing >= 0) folders.splice(existing, 1);
+    folders.unshift({ uri: anchorUri, name: WORKSPACE_ANCHOR_NAME });
+  }
+
+  /**
+   * Replaces `currentFolders` with `nextFolders`, leaving their shared leading
+   * folders (including the workspace anchor) untouched.
+   *
+   * @param {readonly vscode.WorkspaceFolder[]} currentFolders
    * @param {Array<{uri: vscode.Uri, name?: string}>} nextFolders
    */
-  applyWorkspaceFoldersUpdate(deleteCount, nextFolders) {
+  applyWorkspaceFoldersUpdate(currentFolders, nextFolders) {
+    let start = 0;
+    while (
+      start < currentFolders.length &&
+      start < nextFolders.length &&
+      currentFolders[start].uri.toString() === nextFolders[start].uri.toString() &&
+      currentFolders[start].name === nextFolders[start].name
+    ) {
+      start++;
+    }
     return new Promise((resolve) => {
       let settled = false;
       const finish = () => {
@@ -761,7 +796,11 @@ class WorktreeController {
       };
       const sub = vscode.workspace.onDidChangeWorkspaceFolders(() => finish());
       const timer = setTimeout(finish, 2500);
-      const ok = vscode.workspace.updateWorkspaceFolders(0, deleteCount, ...nextFolders);
+      const ok = vscode.workspace.updateWorkspaceFolders(
+        start,
+        currentFolders.length - start,
+        ...nextFolders.slice(start)
+      );
       if (!ok) finish();
     });
   }

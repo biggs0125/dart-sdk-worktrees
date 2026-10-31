@@ -88,6 +88,7 @@ nw -c
 - Opening `nw -c` from inside a subpackage (like `pkg/wasm_builder` or `pkg/vm`) scopes the Dart analyzer to just that folder for fast analysis.
 - From then on, every interactive `nw <branch>` or `nw main` in your terminal **automatically swaps VS Code to the same subpackage in the target worktree** and remaps your open tabs in place.
 - Non-interactive `nw -f ...` invocations (e.g. background AI coding agents creating their own worktrees) **never** hijack your VS Code window.
+- The workspace always lists an empty `nw` folder (`~/.local/state/nw/workspace-anchor`) first. VS Code restarts all extensions whenever the first workspace folder changes (prompting if e.g. a Markdown preview editor is open), so keeping it fixed lets switches swap only the SDK folders. New terminals for it start in your first SDK folder.
 - **Status bar controls** (bottom-left):
   - `$(git-branch) nw: <branch>` — click to switch worktrees from inside VS Code (`Dart Worktrees: Switch Worktree…`).
   - `$(folder-opened) <scope>` — click to re-scope the workspace to full `sdk` or one/more `pkg/*` folders (`Dart Worktrees: Scope Workspace to Package / Subfolder…`).

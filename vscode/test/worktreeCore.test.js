@@ -125,6 +125,7 @@ test('listCheckouts, resolveMappedFolder, and syncWorkspaceFileOnDisk preserve s
     const wtAlpha = path.join(wtRoot, 'alpha');
     const wtBroken = path.join(wtRoot, 'not-a-worktree');
     const wsPath = path.join(tmp, 'dart-sdk', 'active.code-workspace');
+    const anchorDir = path.join(tmp, 'workspace-anchor');
     const dartLink = path.join(tmp, '.dart-current');
     const sdkSubpath = path.join('out', 'ReleaseX64', 'dart-sdk');
 
@@ -160,6 +161,7 @@ test('listCheckouts, resolveMappedFolder, and syncWorkspaceFileOnDisk preserve s
     // Initial scope to pkg/wasm_builder on main.
     core.syncWorkspaceFileOnDisk(mainDir, 'main', ['pkg/wasm_builder'], {
       workspacePath: wsPath,
+      anchorDir,
       mainCheckout: mainDir,
       worktreesDir: wtRoot,
       dartLink,
@@ -169,18 +171,28 @@ test('listCheckouts, resolveMappedFolder, and syncWorkspaceFileOnDisk preserve s
     // Switch to alpha without explicit subpaths: preserves pkg/wasm_builder.
     const nextCfg = core.syncWorkspaceFileOnDisk(wtAlpha, 'alpha', null, {
       workspacePath: wsPath,
+      anchorDir,
       mainCheckout: mainDir,
       worktreesDir: wtRoot,
       dartLink,
       sdkSubpath,
     });
 
+    // The anchor stays first so VS Code doesn't restart the extension host.
     assert.deepEqual(nextCfg.folders, [
+      { name: core.WORKSPACE_ANCHOR_NAME, path: anchorDir },
       {
         name: 'pkg/wasm_builder [alpha]',
         path: path.join(wtAlpha, 'pkg', 'wasm_builder'),
       },
     ]);
+    const anchorSettings = JSON.parse(
+      fs.readFileSync(path.join(anchorDir, '.vscode', 'settings.json'), 'utf8')
+    );
+    assert.equal(
+      anchorSettings['terminal.integrated.cwd'],
+      path.join(wtAlpha, 'pkg', 'wasm_builder')
+    );
     assert.equal(nextCfg.settings['dart.sdkPath'], path.join(mainDir, sdkSubpath));
     assert.deepEqual(
       nextCfg.settings['dart.analysisExcludedFolders'],
