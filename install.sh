@@ -31,7 +31,7 @@ expand_tilde() {
   local p="$1"
   case "$p" in
     "~") echo "$HOME" ;;
-    "~/"*) echo "$HOME/${p#~/}" ;;
+    "~/"*) echo "$HOME/${p#"~/"}" ;;
     *) echo "$p" ;;
   esac
 }

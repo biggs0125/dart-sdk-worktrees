@@ -67,7 +67,8 @@ git -C "$SDK_DIR" add tools/build.py DEPS .gitignore third_party/.gitignore
 git -C "$SDK_DIR" commit -m "Initial mock SDK" >/dev/null
 
 "$REPO_DIR/install.sh" --help | grep -- "--sdk" >/dev/null
-"$REPO_DIR/install.sh" --sdk "$SDK_DIR" >/dev/null
+"$REPO_DIR/install.sh" --sdk "~/dart-sdk/sdk" --worktrees "~/dart-sdk-worktrees" >/dev/null
+grep -F "DART_MAIN_CHECKOUT=$SDK_DIR" "$XDG_CONFIG_HOME/dart-worktrees/config.env" >/dev/null
 test -f "$TMP_HOME/.vscode/extensions/natebiggs.nw-worktrees-0.1.0/package.json"
 
 bash -c '
