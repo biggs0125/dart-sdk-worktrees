@@ -102,6 +102,13 @@ bash -c '
 
   nw --help | grep "Usage:" >/dev/null
   ds --help | grep "Usage:" >/dev/null
+  long_name="$(printf "a%.0s" {1..80})"
+  if long_err="$(nw -f "$long_name" 2>&1)"; then
+    echo "Expected nw to reject overlong worktree name" >&2
+    exit 1
+  fi
+  grep -F "too long for RBE builds" <<< "$long_err" >/dev/null
+  ! test -e "$DART_WORKTREES_DIR/$long_name"
   nw -f feat-one >/dev/null
   test -L "$PWD/third_party/mock_dep"
   test -f "$PWD/third_party/mock_dep/hello.txt"

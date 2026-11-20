@@ -107,15 +107,17 @@ check_name() {
 MAX_SOCKET_PATH=106
 SOCKET_SUFFIX="$DART_OUT_DIR_NAME/$DART_CONFIG_NAME/depscan.sock"
 
-warn_if_name_too_long() {
-  local name="$1"
+check_name_length() {
+  local name="$1" mode="${2:-error}"
   local socket="$WORKTREES_DIR/$name/$SOCKET_SUFFIX"
   (( ${#socket} <= MAX_SOCKET_PATH )) && return 0
   local max_name=$(( ${#name} - ${#socket} + MAX_SOCKET_PATH ))
-  echo "WARNING: worktree name '$name' is too long for RBE builds." >&2
-  echo "  $socket is ${#socket} chars; Unix socket paths must be" \
-    "<= $MAX_SOCKET_PATH, so builds will fail. Use a name of at most" \
-    "$max_name chars (fewer for longer configs than $DART_CONFIG_NAME)." >&2
+  local msg="worktree name '$name' is too long for RBE builds ($socket is ${#socket} chars; Unix socket paths must be <= $MAX_SOCKET_PATH). Use a name of at most $max_name chars (fewer for longer configs than $DART_CONFIG_NAME)."
+  if [[ "$mode" == "warn" ]]; then
+    echo "WARNING: $msg" >&2
+  else
+    die "$msg"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -399,7 +401,7 @@ switch_or_create_worktree() {
       die "worktree '$name' already exists; use -e --seed-out to re-seed"
     log "Switching to $dest"
   else
-    warn_if_name_too_long "$name"
+    check_name_length "$name"
     $force || confirm_create "$name" "$base" || die "not created"
     setup_worktree "$name" "$base" false "$build" "$seed_mode" "$seed_from"
   fi
@@ -627,7 +629,7 @@ main() {
   check_name "$name"
   if $existing; then
     $force && die "-f cannot be combined with -e"
-    warn_if_name_too_long "$name"
+    check_name_length "$name" warn
     setup_worktree "$name" HEAD true "$build" "$seed_mode" "$seed_from"
     request_cd "$WORKTREES_DIR/$name"
     sync_vscode "$name" "$WORKTREES_DIR/$name" "$cwd_subpath" "$code"
