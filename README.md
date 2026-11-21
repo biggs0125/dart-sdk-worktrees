@@ -50,7 +50,7 @@ nw -f -b my-feature            # Create and incrementally build any delta (`crea
 nw -f --no-seed-out my-feature # Create with an empty build directory (skip seeding)
 nw my-feature origin/main      # Create from a specific base ref
 nw main                        # Switch back to your main SDK checkout
-nw -l                          # List `main` and all worktrees (`*` marks current cwd)
+nw -l                          # List `main` and all worktrees (`*` marks current cwd, plus Gerrit CLs)
 nw -d                          # Delete the current worktree + its branch (refuses if dirty unless -f)
 nw -d my-feature               # Delete a named worktree + its branch
 nw -e existing-wt              # Re-link gclient deps, re-run hooks & seed <out>/<config> if unbuilt

@@ -44,7 +44,7 @@
 #                  there are uncommitted or untracked changes, unless -f is
 #                  given.
 #                  The `nw` shell function then cds out of a deleted dir.
-#   -l|--list      List main and the available worktrees.
+#   -l|--list      List main and the available worktrees (and any Gerrit CLs).
 
 set -euo pipefail
 
@@ -517,25 +517,151 @@ delete_worktree() {
 # Listing worktrees
 # ---------------------------------------------------------------------------
 
-# Prints one `nw -l` line, marking the checkout containing cwd with `*`.
-print_list_entry() {
-  local label="$1" dir="$2" cwd="$3" marker=" " root
+# Reads CODE_REVIEW_SERVER from codereview.settings, if present.
+default_gerrit_server() {
+  local settings="$MAIN_CHECKOUT/codereview.settings"
+  [[ -f "$settings" ]] || return 0
+  sed -En 's/^CODE_REVIEW_SERVER:[[:space:]]*([^[:space:]]+).*/\1/p' \
+    "$settings" | head -n 1
+}
+
+# Emits one worktree record for `nw -l`, marking the checkout containing cwd.
+emit_list_entry() {
+  local label="$1" dir="$2" cwd="$3" marker=" " root branch=""
   if [[ -n "$cwd" && -d "$dir" ]]; then
     root="$(cd "$dir" && pwd -P)"
     [[ "$cwd/" == "$root/"* ]] && marker="*"
   fi
-  echo "$marker $label"
+  if [[ -d "$dir" ]]; then
+    branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  fi
+  printf 'ENTRY\t%s\t%s\t%s\n' "$marker" "$label" "$branch"
 }
 
-list_worktrees() {
-  local cwd dir
-  cwd="$(pwd -P 2>/dev/null || true)"
-  print_list_entry "$MAIN_NAME" "$MAIN_CHECKOUT" "$cwd"
+emit_worktree_cl_data() {
+  local cwd="$1" dir server line
+  server="$(default_gerrit_server)"
+  [[ -n "$server" ]] && printf 'DEF_SERVER\t%s\n' "$server"
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && printf 'HEAD_REF\t%s\n' "$line"
+  done < <(git -C "$MAIN_CHECKOUT" for-each-ref --format='%(refname:short)' \
+    refs/heads/ 2>/dev/null || true)
+
+  while IFS= read -r line; do
+    case "$line" in
+      "branch refs/heads/"*)
+        printf 'CHECKED_OUT\t%s\n' "${line#branch refs/heads/}"
+        ;;
+    esac
+  done < <(git -C "$MAIN_CHECKOUT" worktree list --porcelain 2>/dev/null || true)
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && printf 'CFG\t%s\n' "$line"
+  done < <(git -C "$MAIN_CHECKOUT" config --get-regexp \
+    '^branch\..*\.(gerritissue|gerritserver|remote|merge)$' 2>/dev/null || true)
+
+  emit_list_entry "$MAIN_NAME" "$MAIN_CHECKOUT" "$cwd"
   for dir in "$WORKTREES_DIR"/*/; do
     [[ -f "$dir.git" ]] || continue
     dir="${dir%/}"
-    print_list_entry "${dir##*/}" "$dir" "$cwd"
+    emit_list_entry "${dir##*/}" "$dir" "$cwd"
   done
+}
+
+list_worktrees() {
+  local cwd
+  cwd="$(pwd -P 2>/dev/null || true)"
+  emit_worktree_cl_data "$cwd" | awk -F '\t' '
+    function format_cl(b,    srv) {
+      srv = (server[b] != "" ? server[b] : def_server)
+      sub(/\/+$/, "", srv)
+      return (srv != "" ? srv "/" issue[b] : "CL " issue[b])
+    }
+    function local_parent(b) {
+      if (remote[b] == "." && substr(merge[b], 1, 11) == "refs/heads/") {
+        return substr(merge[b], 12)
+      }
+      return ""
+    }
+    $1 == "DEF_SERVER" {
+      def_server = $2
+      sub(/[[:space:]]+$/, "", def_server)
+      next
+    }
+    $1 == "HEAD_REF" {
+      branches[++n_branches] = $2
+      next
+    }
+    $1 == "CHECKED_OUT" {
+      checked_out[$2] = 1
+      next
+    }
+    $1 == "CFG" {
+      raw = $2
+      sp = index(raw, " ")
+      if (sp == 0) next
+      key = substr(raw, 1, sp - 1)
+      val = substr(raw, sp + 1)
+      sub(/^branch\./, "", key)
+      dot = 0
+      for (k = length(key); k > 0; k--) {
+        if (substr(key, k, 1) == ".") { dot = k; break }
+      }
+      if (dot <= 1) next
+      bname = substr(key, 1, dot - 1)
+      prop = substr(key, dot + 1)
+      if (prop == "gerritissue") issue[bname] = val
+      else if (prop == "gerritserver") server[bname] = val
+      else if (prop == "remote") remote[bname] = val
+      else if (prop == "merge") merge[bname] = val
+      next
+    }
+    $1 == "ENTRY" {
+      n_entries++
+      entry_marker[n_entries] = $2
+      entry_label[n_entries] = $3
+      entry_branch[n_entries] = $4
+      if (length($3) > max_len) max_len = length($3)
+      next
+    }
+    END {
+      for (i = 1; i <= n_entries; i++) {
+        b = entry_branch[i]
+        n_cl = 0
+        if (b != "") {
+          if (issue[b] != "" && issue[b] != "0") {
+            cls[++n_cl] = format_cl(b)
+          }
+          q_head = 1; q_tail = 1
+          queue[1] = b
+          visited[i, b] = 1
+          while (q_head <= q_tail) {
+            cur = queue[q_head++]
+            for (j = 1; j <= n_branches; j++) {
+              cand = branches[j]
+              if (((i, cand) in visited) || (cand in checked_out)) continue
+              if (local_parent(cand) == cur) {
+                visited[i, cand] = 1
+                queue[++q_tail] = cand
+                if (issue[cand] != "" && issue[cand] != "0") {
+                  cls[++n_cl] = format_cl(cand) " (" cand ")"
+                }
+              }
+            }
+          }
+        }
+        if (n_cl == 0) {
+          printf "%s %s\n", entry_marker[i], entry_label[i]
+        } else {
+          printf "%s %-*s  %s\n", entry_marker[i], max_len, entry_label[i], cls[1]
+          for (c = 2; c <= n_cl; c++) {
+            printf "  %-*s  %s\n", max_len, "", cls[c]
+          }
+        }
+      }
+    }
+  '
   return 0
 }
 

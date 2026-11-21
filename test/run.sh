@@ -130,6 +130,37 @@ bash -c '
 
   nw feat-one >/dev/null
   nw -l | grep "\* feat-one" >/dev/null
+
+  # Gerrit CL listing: direct CL, stacked local CL, fallback server, and no
+  # duplication for a stacked branch that has its own worktree.
+  printf "CODE_REVIEW_SERVER: https://dart-review.googlesource.com\n" \
+    > "$DART_MAIN_CHECKOUT/codereview.settings"
+  git -C "$DART_MAIN_CHECKOUT" config branch.feat-one.gerritissue 123456
+  git -C "$DART_MAIN_CHECKOUT" config branch.feat-one.gerritserver \
+    https://dart-review.googlesource.com
+  git -C "$DART_MAIN_CHECKOUT" branch --track feat-stacked feat-one >/dev/null
+  git -C "$DART_MAIN_CHECKOUT" config branch.feat-stacked.gerritissue 123457
+  nw -f --no-seed-out feat-child feat-one >/dev/null
+  git -C "$DART_MAIN_CHECKOUT" branch --set-upstream-to=feat-one feat-child >/dev/null
+  git -C "$DART_MAIN_CHECKOUT" config branch.feat-child.gerritissue 123458
+  git -C "$DART_MAIN_CHECKOUT" config branch.feat-child.gerritserver \
+    https://dart-review.googlesource.com
+  nw feat-one >/dev/null
+
+  list_out="$(nw -l)"
+  grep -Ex "  main" <<< "$list_out" >/dev/null
+  grep -E "^\* feat-one[[:space:]]+https://dart-review\.googlesource\.com/123456$" \
+    <<< "$list_out" >/dev/null
+  grep -E "^[[:space:]]+https://dart-review\.googlesource\.com/123457 \(feat-stacked\)$" \
+    <<< "$list_out" >/dev/null
+  grep -E "^  feat-child[[:space:]]+https://dart-review\.googlesource\.com/123458$" \
+    <<< "$list_out" >/dev/null
+  test "$(grep -c "123458" <<< "$list_out")" -eq 1
+
+  nw -d feat-child >/dev/null
+  git -C "$DART_MAIN_CHECKOUT" branch -D feat-stacked >/dev/null
+  rm -f "$DART_MAIN_CHECKOUT/codereview.settings"
+
   ds_err="$(ds feat-one 2>&1 >/dev/null)"
   test -z "$ds_err"
   ds -l main >/dev/null 2>&1
